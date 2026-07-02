@@ -39,7 +39,6 @@ type StatusResponse struct {
 	Backends              []BackendStatusResponse `json:"backends"`
 }
 
-
 func startLoadBalancer() error {
 	runMu.Lock()
 	defer runMu.Unlock()
@@ -51,7 +50,12 @@ func startLoadBalancer() error {
 		return errors.New("no configuration loaded")
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
+	lbPort := os.Getenv("PORT")
+	if lbPort == "" {
+		lbPort = fmt.Sprintf("%d", config.Port)
+	}
+
+	ln, err := net.Listen("tcp", ":"+lbPort)
 	if err != nil {
 		return err
 	}
@@ -139,7 +143,6 @@ func stopLoadBalancer() {
 	isRunning = false
 	fmt.Println("[Balancify] Stopped Load Balancer")
 }
-
 
 func startAdminServer() {
 	// Set Gin to ReleaseMode to avoid debug prints showing up in stdout
@@ -246,8 +249,13 @@ func startAdminServer() {
 		}
 	})
 
-	fmt.Println("[Balancify] Control Panel Server listening on http://localhost:9000")
-	if err := r.Run(":9000"); err != nil {
+	adminPort := os.Getenv("ADMIN_PORT")
+	if adminPort == "" {
+		adminPort = "9000"
+	}
+
+	fmt.Printf("[Balancify] Control Panel Server listening on port %s\n", adminPort)
+	if err := r.Run(":" + adminPort); err != nil {
 		fmt.Printf("[Balancify] Admin server error: %s\n", err)
 	}
 }

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: balancify
+    env: docker
+    plan: free
+    dockerCommand: ./lb
+    envVars:
+      - key: PORT
+        value: 5050 # Render will automatically override this, but good for local
+      - key: ADMIN_PORT
+        value: 9000
