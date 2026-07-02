@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -16,11 +18,9 @@ import (
 )
 
 var (
-	lbListener  net.Listener
-	lbCancel    context.CancelFunc
-	lbWaitGroup sync.WaitGroup
-	isRunning   bool
-	runMu       sync.Mutex
+	lbCancel  context.CancelFunc
+	isRunning bool
+	runMu     sync.Mutex
 )
 
 // Server status response structure
@@ -39,29 +39,12 @@ type StatusResponse struct {
 	Backends              []BackendStatusResponse `json:"backends"`
 }
 
-func startLoadBalancer() error {
-	runMu.Lock()
-	defer runMu.Unlock()
-	if isRunning {
-		return errors.New("load balancer is already running")
-	}
-
+// initBalancer sets up the in-memory backend state from config (no TCP listener needed)
+func initBalancer() error {
 	if config == nil {
 		return errors.New("no configuration loaded")
 	}
 
-	lbPort := os.Getenv("PORT")
-	if lbPort == "" {
-		lbPort = fmt.Sprintf("%d", config.Port)
-	}
-
-	ln, err := net.Listen("tcp", ":"+lbPort)
-	if err != nil {
-		return err
-	}
-	lbListener = ln
-
-	// Reinitialize load balancer state variables
 	idx = 0
 	Dead = make(map[*Pair]bool)
 
@@ -85,16 +68,16 @@ func startLoadBalancer() error {
 		heap.Push(h, server)
 	}
 
-	// Create cancellable context for healthcheck
+	return nil
+}
+
+// startHealthChecker launches the background health check polling goroutine
+func startHealthChecker() {
 	var ctx context.Context
 	ctx, lbCancel = context.WithCancel(context.Background())
-
 	ticker := time.NewTicker(time.Duration(config.HealthCheckIntervalMs) * time.Millisecond)
 
-	// Spin health checking routine
-	lbWaitGroup.Add(1)
 	go func() {
-		defer lbWaitGroup.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -105,52 +88,60 @@ func startLoadBalancer() error {
 			}
 		}
 	}()
-
-	lbWaitGroup.Add(1)
-	go func() {
-		defer lbWaitGroup.Done()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go handleConn(conn)
-		}
-	}()
-
-	isRunning = true
-	fmt.Printf("Started Load Balancer on port %d\n", config.Port)
-	return nil
 }
 
-// stopLoadBalancer terminates the connection listener and healthcheck system
-func stopLoadBalancer() {
-	runMu.Lock()
-	defer runMu.Unlock()
-	if !isRunning {
-		return
-	}
-
-	if lbListener != nil {
-		lbListener.Close()
-	}
-
+// stopBalancer cancels the health checker goroutine
+func stopBalancer() {
 	if lbCancel != nil {
 		lbCancel()
 	}
-
-	lbWaitGroup.Wait()
 	isRunning = false
-	fmt.Println("[Balancify] Stopped Load Balancer")
+	fmt.Println("Load Balancer stopped")
+}
+
+// proxyHandler picks the least-connected backend and reverse-proxies the request
+func proxyHandler(c *gin.Context) {
+	server, err := getBaseurlLeastConn()
+	if err != nil {
+		c.String(http.StatusServiceUnavailable, "No healthy backend available: %s", err.Error())
+		return
+	}
+
+	target, err := url.Parse(server.BaseUrl)
+	if err != nil {
+		releaseConn(server)
+		c.String(http.StatusInternalServerError, "Invalid backend URL")
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
+		deadMu.Lock()
+		Dead[server] = true
+		deadMu.Unlock()
+		mu.Lock()
+		if server.index != -1 {
+			heap.Remove(h, server.index)
+		}
+		mu.Unlock()
+		releaseConn(server)
+		http.Error(w, "Backend unavailable", http.StatusBadGateway)
+	}
+
+	// Inject forwarding headers
+	c.Request.Header.Set("X-Forwarded-For", c.ClientIP())
+	c.Request.Header.Set("X-Forwarded-Proto", c.Request.Proto)
+
+	proxy.ServeHTTP(c.Writer, c.Request)
+	releaseConn(server)
 }
 
 func startAdminServer() {
-	// Set Gin to ReleaseMode to avoid debug prints showing up in stdout
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.Default()
 
-	// CORS middleware configuration
+	// CORS middleware
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT")
@@ -162,18 +153,16 @@ func startAdminServer() {
 		c.Next()
 	})
 
+	// Admin API routes
 	r.GET("/api/status", func(c *gin.Context) {
 		runMu.Lock()
-		res := StatusResponse{
-			Running: isRunning,
-		}
+		res := StatusResponse{Running: isRunning}
 		if config != nil {
 			res.Port = config.Port
 			res.HealthCheckPath = config.HealthCheckPath
 			res.HealthCheckIntervalMs = config.HealthCheckIntervalMs
 		}
 
-		// Fill backend status list
 		deadMu.Lock()
 		res.Backends = make([]BackendStatusResponse, len(baselist))
 		for i, v := range baselist {
@@ -207,7 +196,7 @@ func startAdminServer() {
 		encoder := json.NewEncoder(file)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(newCfg); err != nil {
-			c.String(500, "Failed to encode configuration: %s", err.Error())
+			c.String(500, "Failed to encode config: %s", err.Error())
 			return
 		}
 
@@ -215,47 +204,55 @@ func startAdminServer() {
 		config = &newCfg
 		runMu.Unlock()
 
-		// Reload/Restart balancer
-		stopLoadBalancer()
-		err = startLoadBalancer()
-		if err != nil {
-			c.String(500, "Failed to start Load Balancer: %s", err.Error())
+		// Stop old health checker and reinitialize
+		stopBalancer()
+		if err := initBalancer(); err != nil {
+			c.String(500, "Failed to init balancer: %s", err.Error())
 			return
 		}
+		startHealthChecker()
+		isRunning = true
 
 		c.String(200, "Config updated and Load Balancer restarted")
 	})
 
-	// Stop API
 	r.POST("/api/stop", func(c *gin.Context) {
-		stopLoadBalancer()
+		stopBalancer()
 		c.String(200, "Load Balancer stopped")
 	})
 
-	// Serve Frontend React Static Files Fallback
-	r.NoRoute(func(c *gin.Context) {
-		path := c.Request.URL.Path
-		fullPath := "./frontend/dist" + path
-		if _, err := os.Stat(fullPath); err == nil {
-			c.File(fullPath)
+	// Static frontend assets
+	r.Static("/assets", "./frontend/dist/assets")
+	r.StaticFile("/favicon.ico", "./frontend/dist/favicon.ico")
+	r.StaticFile("/vite.svg", "./frontend/dist/vite.svg")
+
+	// React SPA root
+	r.GET("/", func(c *gin.Context) {
+		if _, err := os.Stat("./frontend/dist/index.html"); err == nil {
+			c.File("./frontend/dist/index.html")
 		} else {
-			// Single page app fallback: serve index.html
-			if _, err := os.Stat("./frontend/dist/index.html"); err == nil {
-				c.File("./frontend/dist/index.html")
-			} else {
-				c.Header("Content-Type", "text/html")
-				c.String(200, "<h3>Control Panel frontend not built yet. Run 'npm run build' inside 'frontend/' to compile it.</h3>")
-			}
+			c.String(200, "<h3>Frontend not built. Run 'npm run build' in the frontend/ directory.</h3>")
 		}
 	})
 
-	adminPort := os.Getenv("ADMIN_PORT")
-	if adminPort == "" {
-		adminPort = "9000"
+	// All other routes → reverse proxy to backends
+	r.NoRoute(func(c *gin.Context) {
+		if isRunning {
+			proxyHandler(c)
+		} else {
+			c.String(http.StatusServiceUnavailable, "Load balancer is not running. Configure and start it via the admin panel.")
+		}
+	})
+
+	// Determine port from environment variable (Render injects $PORT)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9000"
 	}
 
-	fmt.Printf("[Balancify] Control Panel Server listening on port %s\n", adminPort)
-	if err := r.Run(":" + adminPort); err != nil {
-		fmt.Printf("[Balancify] Admin server error: %s\n", err)
+	fmt.Printf("Server listening on port %s\n", port)
+	fmt.Printf("Admin dashboard: http://localhost:%s\n", port)
+	if err := r.Run(":" + port); err != nil {
+		fmt.Printf("Server error: %s\n", err)
 	}
 }

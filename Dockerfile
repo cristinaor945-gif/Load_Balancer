@@ -12,7 +12,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
-RUN go build -o lb .
+RUN go build -o lb main.go admin.go
 
 # Stage 3: Final Production Image
 FROM alpine:latest
