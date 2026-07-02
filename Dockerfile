@@ -19,6 +19,7 @@ FROM alpine:latest
 WORKDIR /app
 # Copy the compiled Go binary
 COPY --from=backend-builder /app/lb .
+COPY config.json .
 # Copy the built React assets into the expected directory
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 # Expose the ports (Documentation purposes)
